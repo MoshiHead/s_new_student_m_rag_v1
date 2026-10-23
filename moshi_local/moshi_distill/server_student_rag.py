@@ -833,12 +833,17 @@ class RAGServerState:
                 self._speech_run = 0
 
             def run_frame(chunk_tensor):
-                """One 80 ms frame. Returns (pcm, kind, meta)."""
-                nonlocal listening, generating, lookup_done, ref_vecs, ref_info
+                """One 80 ms frame, FULL DUPLEX.
+
+                The model generates every frame and keeps its own turn timing
+                (exactly as in training and in server_student.py); the STT/VAD
+                only *triggers retrieval* on end of speech — it never forces
+                the model silent.  Returns (pcm, kind, meta).
+                """
+                nonlocal lookup_done, ref_vecs, ref_info
                 nonlocal current_transcript, stt_token_buffer, stt_in_utterance
                 nonlocal stt_silence_frame_count, stt_last_vad_end
-                nonlocal model_consecutive_pads, barge_in_frame_count
-                nonlocal needs_prompt_replay
+                nonlocal barge_in_frame_count, needs_prompt_replay
 
                 input_codes = self.mimi.encode(chunk_tensor)
                 stt_codes = self.stt_mimi.encode(chunk_tensor)
@@ -846,112 +851,85 @@ class RAGServerState:
                 vad_score = (float(vad_heads[2][0, 0, 0].cpu().item())
                              if vad_heads and len(vad_heads) > 2 else 0.0)
 
-                if listening:
-                    self.lm_gen.step(input_tokens=input_codes,
-                                     moshi_tokens=self.lm_gen._encode_zero_frame(),
-                                     text_token=self.lm_gen.zero_text_code)
-                    if stt_tokens is not None:
-                        stt_token_buffer.append(stt_tokens[:, :1, :].cpu())
-                        if stt_tokens[0, 0, 0].item() not in (0, 3):
-                            stt_in_utterance = True
-                            stt_last_vad_end = False
-                    if vad_score > self.vad_threshold:
-                        stt_silence_frame_count += 1
-                    else:
-                        stt_silence_frame_count = 0
-                    vad_fired = (stt_silence_frame_count >= VAD_SILENCE_FRAMES_REQUIRED
-                                 and not stt_last_vad_end)
-                    stt_last_vad_end = (stt_silence_frame_count
-                                        >= VAD_SILENCE_FRAMES_REQUIRED)
-                    if vad_fired and stt_in_utterance and stt_token_buffer:
-                        transcript = decode_stt_tokens(
-                            stt_token_buffer, self.stt_tokenizer,
-                            self.stt_padding_token_id)
-                        stt_token_buffer = []
-                        stt_in_utterance = False
-                        stt_silence_frame_count = 0
-                        if transcript.strip():
-                            k, vecs, info = self.prepare_reference(transcript)
-                            ref_vecs = vecs
-                            ref_info = info
-                            current_transcript = transcript
-                            lookup_done = False
-                            self._ref_triggered = False
-                            self._ref_queue = []
-                            self._text_queue = []
-                            self._speech_run = 0
-                            listening = False
-                            generating = True
-                            model_consecutive_pads = 0
-                            self.stt_lm_gen.reset_streaming()
-                            self.stt_mimi.reset_streaming()
-                            return (np.zeros(self.frame_size, np.float32),
-                                    "turn_start", {"transcript": transcript,
-                                                   "k": k, "hit": info})
-                    return (np.zeros(self.frame_size, np.float32), "silence", None)
+                # ---- STT transcript -> retrieval trigger (never mutes the model)
+                fired = None
+                if stt_tokens is not None:
+                    stt_token_buffer.append(stt_tokens[:, :1, :].cpu())
+                    if stt_tokens[0, 0, 0].item() not in (0, 3):
+                        stt_in_utterance = True
+                        stt_last_vad_end = False
+                if vad_score > self.vad_threshold:
+                    stt_silence_frame_count += 1
+                else:
+                    stt_silence_frame_count = 0
+                vad_fired = (stt_silence_frame_count >= VAD_SILENCE_FRAMES_REQUIRED
+                             and not stt_last_vad_end)
+                stt_last_vad_end = (stt_silence_frame_count
+                                    >= VAD_SILENCE_FRAMES_REQUIRED)
+                if vad_fired and stt_in_utterance and stt_token_buffer:
+                    transcript = decode_stt_tokens(
+                        stt_token_buffer, self.stt_tokenizer,
+                        self.stt_padding_token_id)
+                    stt_token_buffer = []
+                    stt_in_utterance = False
+                    stt_silence_frame_count = 0
+                    if transcript.strip():
+                        k, vecs, info = self.prepare_reference(transcript)
+                        ref_vecs = vecs
+                        ref_info = info
+                        current_transcript = transcript
+                        lookup_done = False
+                        self._ref_triggered = False
+                        self._ref_queue = []
+                        self._text_queue = []
+                        self._speech_run = 0
+                        fired = {"transcript": transcript, "k": k, "hit": info}
 
-                # ---- generating -----------------------------------------
-                # Additive reference: one queued vector per frame, added to the
-                # embedding the transformer reads this call (no extra frames).
+                # ---- free generation (full duplex) -------------------------
                 ref_vec = self._ref_queue.pop(0) if self._ref_queue else None
                 forced_text = self._text_queue.pop(0) if self._text_queue else None
                 tokens = self._time_step(input_codes, ref_vec, forced_text)
+                if tokens is None:
+                    return (np.zeros(self.frame_size, np.float32), "silence", None)
+
+                text_token = int(tokens[0, 0, 0].item())
+                with torch.no_grad():
+                    main_pcm = self.mimi.decode(tokens[:, 1:9]).cpu()
+                pcm = np.clip(main_pcm[0, 0].float().numpy(), -1.0, 1.0)
+
+                # ---- barge-in: the user talks over the model's speech ------
                 speech_this_frame = (stt_tokens is not None
                                      and stt_tokens[0, 0, 0].item() not in (0, 3)
                                      and vad_score < self.vad_threshold)
+                model_speaking = not self._in_pause(pcm)
                 barge_in_frame_count = (barge_in_frame_count + 1
-                                        if speech_this_frame else 0)
+                                        if (speech_this_frame and model_speaking) else 0)
                 if barge_in_frame_count >= BARGE_IN_FRAMES_REQUIRED:
                     barge_in_frame_count = 0
                     reset_streams()
-                    listening = True
-                    generating = False
                     lookup_done = False
                     ref_vecs = ref_info = None
                     stt_token_buffer = []
                     stt_in_utterance = True
                     stt_last_vad_end = False
                     stt_silence_frame_count = 0
-                    model_consecutive_pads = 0
                     needs_prompt_replay = True
-                    return (np.zeros(self.frame_size, np.float32),
-                            "barge_in", None)
+                    return (np.zeros(self.frame_size, np.float32), "barge_in", None)
 
-                if tokens is None:
-                    return (np.zeros(self.frame_size, np.float32), "silence", None)
-
-                text_token = int(tokens[0, 0, 0].item())
-                # Mimi's decoder has trainable params, so its output carries a
-                # grad_fn unless we disable grad here (the LM step is already
-                # under no_grad, this one was not).
-                with torch.no_grad():
-                    main_pcm = self.mimi.decode(tokens[:, 1:9]).cpu()
-                pcm = np.clip(main_pcm[0, 0].float().numpy(), -1.0, 1.0)
-
-                if text_token not in (0, 3):
-                    model_consecutive_pads = 0
-                else:
-                    model_consecutive_pads += 1
-
-                # Never let card tokens spill into the answer: if the model has
-                # started speaking while the card is still draining, drop the
-                # rest.  Training truncated the card to the pause length too.
+                # ---- never let card tokens spill into the answer -----------
                 if self._text_queue:
                     if self._in_pause(pcm):
                         self._speech_run = 0
                     else:
                         self._speech_run += 1
                         if self._speech_run >= 2:
-                            logger.info("card truncated at speech: "
-                                        "%d tokens dropped", len(self._text_queue))
+                            logger.info("card truncated at speech: %d tokens dropped",
+                                        len(self._text_queue))
                             self._text_queue = []
                 else:
                     self._speech_run = 0
 
-                # RAG trigger: <lookup> is emitted by the model itself, but the
-                # web search may still be in flight.  The lead + filler buys it
-                # 2-4 s; if it needs a little more, spend the model's own pause
-                # on it (a few frames, never the answer).
+                # ---- <lookup> -> card injection ----------------------------
                 if text_token == self.lookup_id and not lookup_done:
                     self._ref_triggered = True
                 if self._ref_triggered and not lookup_done:
@@ -973,9 +951,6 @@ class RAGServerState:
                             logger.info("using web passage %r",
                                         job["hits"][0]["text"][:90])
                     if self._ref_wait > 0 and not self._in_pause(pcm):
-                        # we spent pause frames waiting and it is over:
-                        # answering without a card beats spilling card tokens
-                        # into the first words
                         logger.info("ref dropped: pause ended before injection")
                         ref_vecs = None
                     n_ref = (int(ref_vecs.shape[1])
@@ -985,17 +960,11 @@ class RAGServerState:
                     lookup_done = True
                     if n_ref > 0:
                         if self.ref_mode == "add":
-                            # Zero-frame injection: queue the vectors and keep
-                            # the stream running.  Only the <lookup> frame
-                            # itself is muted (control token, never spoken).
                             k = self.start_ref_add(ref_vecs)
                             return (np.zeros(self.frame_size, np.float32),
                                     "ref_inject",
                                     {"frames": 0, "k": k, "hit": ref_info})
                         if self.ref_mode == "text" and self.ref_pos == "pause":
-                            # Card rides the pause the model produces anyway:
-                            # the <lookup> frame and every card frame keep their
-                            # own audio, so no sample of silence is added.
                             k = self.start_ref_text_pause(
                                 ref_vecs if not torch.is_tensor(ref_vecs) else [])
                             self._speech_run = 0
@@ -1004,23 +973,15 @@ class RAGServerState:
                         n_frames = (self.inject_ref_text(ref_vecs)
                                     if self.ref_mode == "text"
                                     else self.inject_ref_block(ref_vecs))
-                        # the prefill frames are silent on the wire
                         return (np.zeros(self.frame_size * n_frames, np.float32),
                                 "ref_inject",
-                                {"frames": n_frames, "k": n_ref,
-                                 "hit": ref_info})
+                                {"frames": n_frames, "k": n_ref, "hit": ref_info})
                 if text_token == self.lookup_id:
                     # duplicate / no-reference lookup: never leak the token
                     pcm = np.zeros(self.frame_size, np.float32)
 
-                if model_consecutive_pads >= IDLE_PAD_LIMIT:
-                    listening = True
-                    generating = False
-                    model_consecutive_pads = 0
-                    self._ref_queue = []
-                    self._text_queue = []
-                    return (pcm, "turn_end", None)
-
+                if fired is not None:
+                    return (pcm, "turn_start", fired)
                 return (pcm, "audio",
                         {"text": text_token if forced_text is None else 0})
 
