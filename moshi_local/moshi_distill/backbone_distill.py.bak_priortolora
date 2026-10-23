@@ -1,0 +1,1219 @@
+"""
+backbone_distill.py — depth-pruned PersonaPlex backbone distillation
+====================================================================
+
+Implements `backbone_distillation_demo_plan.md`.  This is a *different* track
+from the grouped DepFormer work: the backbone (main temporal transformer) is
+made smaller by keeping a subset of the teacher's layers, keeping `d_model`,
+the embeddings, `out_norm`, `text_linear`, Mimi and the DepFormer unchanged.
+
+Pieces in this file (first slice)
+--------------------------------
+* :func:`select_layers` / :func:`block_influence` — choose which teacher layers
+  to keep (spaced or contiguous, always keep the first/last few).
+* :func:`build_student` — construct an `LMModel` with `len(kept)` layers and
+  initialise every shared tensor from the teacher, with student layer `i` taking
+  teacher layer `kept[i]` (no random init).
+* :func:`forward_distill` — one teacher-forced pass returning post-`out_norm`
+  hidden states, undelayed text logits, undelayed DepFormer audio logits and
+  optional intermediate layer features.  Used for both the frozen teacher
+  (`no_grad`) and the student (with grad).
+* Losses: `L_h` (per-dim-normalised MSE + cosine), `L_text` (full KL + top-k /
+  temperature-matched KL, non-PAD up-weighted), `L_audio` (frozen-DepFormer KL on
+  agent slots), optional `L_feat` (mapped intermediate layers, stage 1).
+* `_self_test` — CPU end-to-end including the plan's S0 sanity: a student with
+  **0 layers dropped** must equal the teacher.
+
+Still to come (tracked by the plan): batched rollout token generation (§3.3),
+layer-drop ablation runner (§4.1), the multi-stage trainer with fp32 master
+weights + 8-bit AdamW, on-policy round (§5.4), PTQ for the depformer hand-off.
+"""
+
+from __future__ import annotations
+
+import argparse
+import copy
+import logging
+import time
+from dataclasses import dataclass, field
+from pathlib import Path
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+from .models.lm import (
+    LMModel,
+    AUDIO_TOKENS_PER_STREAM,
+    SILENCE_TOKENS,
+    SINE_TOKENS,
+    _delay_sequence,
+    _undelay_sequence,
+)
+
+logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Layer selection
+# ---------------------------------------------------------------------------
+
+def select_layers(n_teacher: int, n_keep: int, strategy: str = "spaced",
+                  keep_first: int = 2, keep_last: int = 4) -> list[int]:
+    """Return the teacher layer indices to keep, in order.
+
+    ``strategy="spaced"`` removes layers evenly across the middle; the first
+    ``keep_first`` and last ``keep_last`` layers are always kept.  ``strategy=
+    "contiguous"`` keeps the front block plus the tail.
+    """
+    assert 0 < n_keep <= n_teacher, (n_keep, n_teacher)
+    if n_keep == n_teacher:
+        return list(range(n_teacher))
+    first = list(range(min(keep_first, n_teacher)))
+    last = list(range(max(keep_first, n_teacher - keep_last), n_teacher))
+    middle = [i for i in range(n_teacher) if i not in first and i not in last]
+    need = n_keep - len(first) - len(last)
+    if need <= 0:
+        # n_keep small: keep first/last then fill from the middle edges
+        keep = first + last
+        return sorted(keep[:n_keep]) if keep_first + keep_last >= n_keep else \
+            sorted((first[:n_keep // 2] + last[-(n_keep - n_keep // 2):]))
+    if strategy == "spaced":
+        if need >= len(middle):
+            chosen = middle
+        else:
+            # evenly spaced picks across the middle block
+            step = len(middle) / need
+            chosen = [middle[min(len(middle) - 1, int(round((k + 0.5) * step - 0.5)))]
+                      for k in range(need)]
+            chosen = sorted(set(chosen))
+            j = 0
+            while len(chosen) < need and j < len(middle):
+                if middle[j] not in chosen:
+                    chosen.append(middle[j])
+                    chosen = sorted(chosen)
+                j += 1
+    elif strategy == "contiguous":
+        # keep the front block + a contiguous middle block ending at the tail
+        chosen = middle[:need]
+    else:
+        raise ValueError(f"unknown strategy {strategy!r}")
+    return sorted(first + chosen + last)
+
+
+@torch.no_grad()
+def block_influence(model, codes: torch.Tensor, feat_layers: list[int] | None = None
+                    ) -> torch.Tensor:
+    """Per-layer block influence ``1 - cos(h_in, h_out)`` averaged over frames.
+
+    Cheap ranking signal for which layers do the least to the hidden state.
+    ``feat_layers`` defaults to all transformer layers.
+    """
+    if feat_layers is None:
+        feat_layers = list(range(len(model.transformer.layers)))
+    ins: dict[int, torch.Tensor] = {}
+    outs: dict[int, torch.Tensor] = {}
+    handles = []
+    for l in feat_layers:
+        handles.append(model.transformer.layers[l].register_forward_hook(
+            (lambda l: (lambda m, i, o: outs.__setitem__(l, _as_tensor(o))))(l)))
+    hidden = forward_distill(model, codes)["hidden"]
+    for h in handles:
+        h.remove()
+    # h_in is not directly available; recompute by capturing the layer input
+    # through a pre-hook instead.
+    handles = []
+    for l in feat_layers:
+        handles.append(model.transformer.layers[l].register_forward_pre_hook(
+            (lambda l: (lambda m, i: ins.__setitem__(l, _as_tensor(i[0]))))(l)))
+    _ = forward_distill(model, codes)["hidden"]
+    for h in handles:
+        h.remove()
+    bi = []
+    for l in feat_layers:
+        a = ins[l].float().reshape(-1, ins[l].shape[-1])
+        b = outs[l].float().reshape(-1, outs[l].shape[-1])
+        cos = F.cosine_similarity(a, b, dim=-1)
+        bi.append(float((1.0 - cos).mean()))
+    return torch.tensor(bi)
+
+
+def _as_tensor(o):
+    if isinstance(o, (tuple, list)):
+        return o[0]
+    return o
+
+
+# ---------------------------------------------------------------------------
+# Student construction
+# ---------------------------------------------------------------------------
+
+def build_student(teacher: LMModel, kept_layers: list[int],
+                  base_kwargs: dict, device=None, dtype=None,
+                  freeze_depformer: bool = True) -> LMModel:
+    """Build an `LMModel` with ``len(kept_layers)`` layers, teacher-initialised.
+
+    ``base_kwargs`` is the teacher's constructor kwargs (e.g. `loaders._lm_kwargs`
+    with ``dep_q`` set); ``num_layers`` is overridden.  Student layer ``i`` takes
+    the weights of teacher layer ``kept_layers[i]``; every other tensor
+    (embeddings, out_norm, text head, DepFormer) is copied verbatim.
+    """
+    kw = dict(base_kwargs)
+    kw["num_layers"] = len(kept_layers)
+    student = LMModel(device=device, dtype=dtype, **kw)
+
+    t_sd = teacher.state_dict()
+    s_sd = student.state_dict()
+    new_sd = {}
+    for k in s_sd:
+        if "transformer.layers." in k:
+            pre, rest = k.split("transformer.layers.", 1)
+            idx_str, suffix = rest.split(".", 1)
+            new_sd[k] = t_sd[
+                f"{pre}transformer.layers.{kept_layers[int(idx_str)]}.{suffix}"]
+        elif k in t_sd:
+            new_sd[k] = t_sd[k]
+        else:
+            raise KeyError(f"student key {k!r} has no teacher counterpart")
+    missing, unexpected = student.load_state_dict(new_sd, strict=False)
+    if unexpected:
+        raise RuntimeError(f"unexpected keys when copying teacher weights: {unexpected[:5]}")
+    if missing:
+        # only the deliberately-pruned layer slots (they are filled above)
+        raise RuntimeError(f"missing keys when copying teacher weights: {missing[:5]}")
+
+    # `LMModel` builds text_linear / out_norm / depformer_in / linears without
+    # device/dtype, so move the assembled student explicitly.
+    if device is not None:
+        student = student.to(device)
+    if dtype is not None:
+        student = student.to(dtype)
+
+    if freeze_depformer:
+        for mod in (student.depformer, student.depformer_in, student.depformer_emb,
+                    student.depformer_text_emb, student.linears):
+            for p in mod.parameters():
+                p.requires_grad_(False)
+    return student
+
+
+def teacher_kwargs(dep_q: int = 16) -> dict:
+    """Constructor kwargs for the released PersonaPlex/Moshi backbone.
+
+    Use with :func:`build_student`::
+        build_student(teacher, select_layers(32, 16), teacher_kwargs())
+    """
+    from .models import loaders
+    kw = dict(loaders._lm_kwargs)
+    kw["dep_q"] = dep_q
+    return kw
+
+
+def finetune_top_layers(student: LMModel, n_trainable: int) -> None:
+    """Freeze all transformer layers except the top ``n_trainable``."""
+    layers = student.transformer.layers
+    for i, layer in enumerate(layers):
+        keep = i >= (len(layers) - n_trainable)
+        for p in layer.parameters():
+            p.requires_grad_(keep)
+
+
+def freeze_embeddings_and_heads(student: LMModel, freeze: bool = True) -> None:
+    """Freeze/unfreeze embeddings, out_norm and the text head (plan §5.3)."""
+    mods = [student.emb, student.text_emb, student.out_norm, student.text_linear]
+    for mod in mods:
+        if mod is None:
+            continue
+        for p in mod.parameters():
+            p.requires_grad_(not freeze)
+
+
+# ---------------------------------------------------------------------------
+# Teacher-forced forward (frozen teacher OR student)
+# ---------------------------------------------------------------------------
+
+def forward_distill(model: LMModel, codes: torch.Tensor,
+                    feat_layers: list[int] | None = None
+                    ) -> dict[str, torch.Tensor]:
+    """One teacher-forced pass mirroring ``LMModel.forward_train``.
+
+    Returns post-``out_norm`` hidden states (the DepFormer/text-head input),
+    undelayed text logits, undelayed DepFormer audio logits and their masks.
+    ``feat_layers`` additionally captures those transformer layers' outputs.
+    """
+    B, K, T = codes.shape
+    assert K == model.num_codebooks, (K, model.num_codebooks)
+
+    initial = model._get_initial_token().expand(B, -1, -1)
+    delayed = _delay_sequence(model.delays, codes, initial)
+    delayed = torch.cat([initial, delayed], dim=2)          # [B, K, T+1]
+
+    emb = model.embed_codes(delayed[:, :, :-1])
+
+    feats: dict[int, torch.Tensor] = {}
+    handles = []
+    if feat_layers:
+        for l in feat_layers:
+            handles.append(model.transformer.layers[l].register_forward_hook(
+                (lambda l: (lambda m, i, o: feats.__setitem__(l, _as_tensor(o))))(l)))
+    transformer_out, _ = model.forward_embeddings(emb)       # post out_norm
+    for h in handles:
+        h.remove()
+
+    text_logits = model.text_linear(transformer_out)[:, None]
+    audio_logits = model.forward_depformer_training(delayed[:, :, 1:], transformer_out)
+
+    audio_logits, audio_mask = _undelay_sequence(
+        model.delays[model.audio_offset:model.audio_offset + model.dep_q],
+        audio_logits, fill_value=float("nan"))
+    audio_mask &= (codes[:, model.audio_offset:model.audio_offset + model.dep_q]
+                   != model.zero_token_id)
+    text_logits, text_mask = _undelay_sequence(
+        model.delays[:1], text_logits, fill_value=float("nan"))
+    text_mask &= (codes[:, :1] != model.zero_token_id)
+
+    return {
+        "hidden": transformer_out,          # [B, T, D] post out_norm
+        "text_logits": text_logits,         # [B, 1, T, text_card]
+        "text_mask": text_mask,             # [B, 1, T]
+        "audio_logits": audio_logits,       # [B, dep_q, T, card]
+        "audio_mask": audio_mask,           # [B, dep_q, T]
+        "feats": feats,                     # {layer: [B, T, D]}
+    }
+
+
+# ---------------------------------------------------------------------------
+# Losses
+# ---------------------------------------------------------------------------
+
+def _wmean(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
+    w = w.float()
+    return (x.float() * w).sum() / w.sum().clamp(min=1e-8)
+
+
+def loss_hidden(s_h: torch.Tensor, t_h: torch.Tensor, frame_valid: torch.Tensor,
+                cos_weight: float = 1.0) -> torch.Tensor:
+    """``mse(s_h/σ_t, t_h/σ_t) + cos_weight*(1 - cos)`` (plan §5.1, §7.4)."""
+    sigma = t_h.detach().float().std(dim=(0, 1), unbiased=False).clamp_min(1e-4)
+    mse = ((s_h.float() - t_h.float()) / sigma).square().mean(-1)   # [B, T]
+    cos = 1.0 - F.cosine_similarity(s_h.float(), t_h.float(), dim=-1)
+    return _wmean(mse + cos_weight * cos, frame_valid)
+
+
+def _flat_kl(p_logits, q_logits, mask, temperature):
+    p = torch.softmax(p_logits.float() / temperature, dim=-1)
+    logq = torch.log_softmax(q_logits.float() / temperature, dim=-1)
+    kl = (p * (p.clamp_min(1e-12).log() - logq)).sum(-1)
+    return _wmean(kl, mask)
+
+
+def _topk_kl(p_logits, q_logits, mask, k, temperature):
+    v = p_logits.size(-1)
+    kk = min(int(k), v)
+    idx = torch.topk(p_logits.float(), kk, dim=-1).indices
+    p_at = p_logits.float().gather(-1, idx)
+    q_at = q_logits.float().gather(-1, idx)
+    p = torch.softmax(p_at / temperature, dim=-1)
+    logq = torch.log_softmax(q_at / temperature, dim=-1)
+    kl = (p * (p.clamp_min(1e-12).log() - logq)).sum(-1)
+    return _wmean(kl, mask)
+
+
+def loss_text(s_text_logits, t_text_logits, text_mask, text_codes,
+              pad_ids, temperature: float = 1.0, top_k: int = 25,
+              samp_temp: float = 0.7, nonpad_weight: float = 3.0) -> torch.Tensor:
+    """Text KD: full KL + top-k/temp-matched KL, non-PAD frames up-weighted.
+
+    PAD dominates the text stream (plan §7.3); without the up-weight the student
+    collapses to PAD.
+    """
+    p = torch.nan_to_num(t_text_logits.float(), nan=0.0)
+    q = torch.nan_to_num(s_text_logits.float(), nan=0.0)
+    mask = text_mask.float()
+    nonpad = torch.ones_like(mask)
+    for pid in pad_ids:
+        nonpad = nonpad * (text_codes[:, None] != pid).float()
+    w = mask * (1.0 + (nonpad_weight - 1.0) * nonpad)
+    full = _flat_kl(p, q, w, temperature)
+    topk = _topk_kl(p, q, w, top_k, samp_temp)
+    return full + topk
+
+
+def loss_audio(s_audio_logits, t_audio_logits, audio_mask,
+               codebook_weights: torch.Tensor | None = None,
+               agent_only: bool = True, frame_keep: float = 1.0,
+               temperature: float = 1.0) -> torch.Tensor:
+    """Frozen-DepFormer KD on the student's and teacher's hidden states.
+
+    Gradients flow through the student hidden (the DepFormer is frozen).  Only
+    agent slots participate by default (the user stream is provided at serving).
+    """
+    p = torch.nan_to_num(t_audio_logits.float(), nan=0.0)
+    q = torch.nan_to_num(s_audio_logits.float(), nan=0.0)
+    B, Ka, T, card = q.shape
+    if agent_only:
+        Ka = min(8, Ka)
+        p, q = p[:, :Ka], q[:, :Ka]
+    mask = audio_mask[:, :Ka].float()
+    if frame_keep < 1.0:
+        keep = (torch.rand_like(mask) < frame_keep).float()
+        mask = mask * keep
+    if codebook_weights is None:
+        codebook_weights = torch.ones(Ka, device=q.device)
+    w = codebook_weights.to(q.device).float().view(1, -1, 1)
+    p_s = torch.softmax(p / temperature, dim=-1)
+    logq = torch.log_softmax(q / temperature, dim=-1)
+    kl = (p_s * (p_s.clamp_min(1e-12).log() - logq)).sum(-1)   # [B, Ka, T]
+    ww = mask * w
+    return (kl * ww).sum() / ww.sum().clamp(min=1e-8)
+
+
+def loss_feat(s_feats: dict[int, torch.Tensor], t_feats: dict[int, torch.Tensor],
+              frame_valid: torch.Tensor) -> torch.Tensor:
+    """Mapped-intermediate-layer MSE (student layer i -> teacher layer map[i])."""
+    total = None
+    for s_l, t_l in zip(s_feats, t_feats):
+        s = s_feats[s_l]
+        t = t_feats[t_l]
+        sigma = t.detach().float().std(dim=(0, 1), unbiased=False).clamp_min(1e-4)
+        per = ((s.float() - t.float()) / sigma).square().mean(-1)
+        term = _wmean(per, frame_valid)
+        total = term if total is None else total + term
+    return total if total is not None else torch.zeros((), device=frame_valid.device)
+
+
+@dataclass
+class BackboneDistillWeights:
+    hidden: float = 1.0
+    feat: float = 1.0
+    text: float = 1.0
+    audio: float = 0.5
+    audio_frame_keep: float = 0.25
+    stage1_frac: float = 0.2
+
+
+def frame_valid_mask(codes: torch.Tensor, offset: int,
+                     zero_token_id: int) -> torch.Tensor:
+    """[B, T] valid-frame mask from the first audio codebook (plan §7.1)."""
+    return codes[:, offset] != zero_token_id
+
+
+def backbone_distill_loss(s_out: dict, t_out: dict, codes: torch.Tensor,
+                          frame_valid: torch.Tensor,
+                          pad_ids: set[int] | tuple[int, ...],
+                          weights: BackboneDistillWeights, stage: int
+                          ) -> tuple[torch.Tensor, dict[str, float]]:
+    """Assemble the stage objective (plan §5.1).
+
+    stage 1: ``w_h*L_h + w_feat*L_feat``
+    stage 2: ``w_h*L_h + w_text*L_text + w_audio*L_audio``
+    """
+    stats: dict[str, float] = {}
+    l_h = loss_hidden(s_out["hidden"], t_out["hidden"], frame_valid)
+    total = weights.hidden * l_h
+    stats["hidden"] = float(l_h)
+
+    if stage == 1:
+        if s_out["feats"] and t_out["feats"]:
+            l_f = loss_feat(s_out["feats"], t_out["feats"], frame_valid)
+            total = total + weights.feat * l_f
+            stats["feat"] = float(l_f)
+    else:
+        l_t = loss_text(s_out["text_logits"], t_out["text_logits"],
+                        t_out["text_mask"], codes[:, 0], pad_ids)
+        total = total + weights.text * l_t
+        stats["text"] = float(l_t)
+
+        l_a = loss_audio(s_out["audio_logits"], t_out["audio_logits"],
+                         t_out["audio_mask"],
+                         frame_keep=weights.audio_frame_keep)
+        total = total + weights.audio * l_a
+        stats["audio"] = float(l_a)
+
+    stats["loss"] = float(total)
+    return total, stats
+
+
+# ---------------------------------------------------------------------------
+# Batched rollout token generation (plan §3.1/§3.3)
+# ---------------------------------------------------------------------------
+
+@torch.no_grad()
+def rollout_tokens_batched(teacher_lm, samples, device="cuda", temp: float = 0.8,
+                           top_k: int = 250, batch_size: int = 32,
+                           max_frames: int | None = None,
+                           pad_token_id: int | None = None
+                           ) -> list[torch.Tensor]:
+    """Batched teacher rollouts, **tokens only** (plan §3.1/§3.3).
+
+    ``samples`` is a list of ``(codes, prompt_len)`` where ``codes`` is
+    ``[1, 17, T]`` (system-prompt block already prepended by the interleaver)
+    and ``prompt_len`` is the number of forced leading frames.  The forced
+    persona block is replayed (text + agent silence + user sine), then the USER
+    stream is provided and the teacher generates agent+text.
+
+    Streams are grouped by ``prompt_len`` so the forced block lines up, and
+    ``LMGen`` runs ``batch_size`` streams at once (the plan's throughput fix).
+    Returns one ``[1, 17, F]`` generated-code tensor per input sample.
+    """
+    from .models.lm import LMGen
+
+    aps = 8
+    if pad_token_id is None:
+        pad_token_id = teacher_lm.zero_token_id
+    gen = LMGen(teacher_lm, device=device, use_sampling=True, temp=temp,
+                top_k=top_k, top_k_text=25, return_logits=False,
+                fast_provided_tail=False)
+    gen.eval()
+    max_delay = gen.max_delay
+
+    groups: dict[tuple, list[int]] = {}
+    for i, (codes_i, plen) in enumerate(samples):
+        plen = int(plen)
+        # Group by the actual forced prompt BLOCK (not just its length): samples
+        # sharing a persona/voice produce an identical block and batch together,
+        # which is what makes "all samples" generation fast (plan §3.3).
+        if plen > 0:
+            block = (codes_i[0, :, :plen].detach().to(torch.int32).cpu()
+                     .contiguous().numpy().tobytes())
+            key = (plen, hash(block))
+        else:
+            key = (0, 0)
+        groups.setdefault(key, []).append(i)
+
+    results: list[torch.Tensor | None] = [None] * len(samples)
+    n_done = 0
+    for key, idxs in groups.items():
+        plen = key[0]
+        for j in range(0, len(idxs), batch_size):
+            sel = idxs[j:j + batch_size]
+            B = len(sel)
+            T = max(samples[i][0].shape[-1] for i in sel)
+            user = torch.full((B, aps, T), pad_token_id, dtype=torch.long, device=device)
+            agent = torch.full((B, aps, T), pad_token_id, dtype=torch.long, device=device)
+            text = torch.full((B, T), pad_token_id, dtype=torch.long, device=device)
+            lens = []
+            for r, i in enumerate(sel):
+                c = samples[i][0].to(device)
+                L = c.shape[-1]
+                lens.append(L)
+                user[r, :, :L] = c[0, 1 + aps:1 + 2 * aps]
+                if plen > 0:
+                    k = min(plen, L)
+                    agent[r, :, :k] = c[0, 1:1 + aps, :k]
+                    text[r, :k] = c[0, 0, :k]
+
+            with gen.streaming(B):
+                gen.reset_streaming()
+                frames = []
+                for f in range(T):
+                    if f < plen:
+                        out = gen.step(input_tokens=user[:, :, f:f + 1],
+                                       moshi_tokens=agent[:, :, f:f + 1],
+                                       text_token=text[:, f])
+                    else:
+                        out = gen.step(input_tokens=user[:, :, f:f + 1])
+                    if out is None:
+                        continue
+                    if isinstance(out, tuple):
+                        out = out[0]
+                    if out is None:
+                        continue
+                    frames.append(out[:, :, 0])                 # [B, 17]
+            if not frames:
+                continue
+            codes_gen = torch.stack(frames, dim=2)              # [B, 17, F]
+            for r, i in enumerate(sel):
+                # drop frames beyond this stream's own input length
+                keep = max(1, lens[r] - max_delay)
+                results[i] = codes_gen[r:r + 1, :, :keep].cpu()
+            n_done += len(sel)
+            if n_done % (batch_size * 10) < batch_size:
+                logger.info("rollout: %d/%d samples generated", n_done, len(samples))
+
+    out = [r for r in results if r is not None]
+    logger.info("rollout_tokens_batched: %d/%d samples generated", len(out), len(samples))
+    return out
+
+
+@torch.no_grad()
+def forced_prompt_len(codes: torch.Tensor, zero_token_id: int) -> int:
+    """Length of the leading forced ``<system>`` persona block (plan §3.1).
+
+    Detects the run where agent codebooks == ``SILENCE_TOKENS`` and user
+    codebooks == ``SINE_TOKENS`` with real text.  Returns 0 when the chunk has
+    no prompt (e.g. ``start_sec > 0``).
+    """
+    aps = AUDIO_TOKENS_PER_STREAM
+    if codes.shape[1] < 1 + 2 * aps:
+        return 0
+    agent = codes[0, 1:1 + aps]
+    user = codes[0, 1 + aps:1 + 2 * aps]
+    silence = torch.as_tensor(SILENCE_TOKENS, dtype=agent.dtype,
+                              device=agent.device).unsqueeze(1)
+    sine = torch.as_tensor(SINE_TOKENS, dtype=user.dtype,
+                           device=user.device).unsqueeze(1)
+    match = ((agent == silence).all(0) & (user == sine).all(0)
+             & (codes[0, 0] != zero_token_id))
+    n, T = 0, codes.shape[-1]
+    while n < T and bool(match[n]):
+        n += 1
+    return n
+
+
+@torch.no_grad()
+def collect_tokens(teacher_lm, loader, device, max_batches: int = 1000,
+                   max_samples: int | None = None, batch_size: int = 32,
+                   temp: float = 0.8, top_k: int = 250
+                   ) -> list[torch.Tensor]:
+    """Generate the tokens-only rollout cache (plan §3.1/§3.3).
+
+    ``loader`` yields batches with ``.codes`` ``[B, 17, T]`` (interleaver output,
+    persona already prepended).  Returns a list of ``[1, 17, F]`` teacher
+    rollouts.  Storing only tokens is ~34 B/frame (~34 MB per 1M frames).
+    """
+    samples = []
+    for i, batch in enumerate(loader):
+        if i >= max_batches:
+            break
+        codes_all = batch.codes
+        for b in range(codes_all.shape[0]):
+            c = codes_all[b:b + 1]
+            plen = forced_prompt_len(c, teacher_lm.zero_token_id)
+            samples.append((c, plen))
+            if max_samples is not None and len(samples) >= max_samples:
+                break
+        if max_samples is not None and len(samples) >= max_samples:
+            break
+    logger.info("collect_tokens: %d samples queued; generating...", len(samples))
+    return rollout_tokens_batched(teacher_lm, samples, device=device,
+                                  batch_size=batch_size, temp=temp, top_k=top_k)
+
+
+def _collate_token_batch(tensors: list[torch.Tensor], pad_token_id: int,
+                         device) -> torch.Tensor:
+    """Stack ``[1,17,T_i]`` rollouts into ``[B,17,Tmax]`` (right-pad -1)."""
+    B = len(tensors)
+    T = max(t.shape[-1] for t in tensors)
+    out = torch.full((B, 17, T), pad_token_id, dtype=torch.long, device=device)
+    for r, t in enumerate(tensors):
+        n = t.shape[-1]
+        out[r, :, :n] = t[0, :, :n].to(device)
+    return out
+
+
+
+
+# ---------------------------------------------------------------------------
+# Layer-drop ablation (plan §4.1)
+# ---------------------------------------------------------------------------
+
+@torch.no_grad()
+def layer_drop_ablation(teacher_lm, codes: torch.Tensor, base_kwargs: dict,
+                        candidates: list[int] | None = None,
+                        frame_valid: torch.Tensor | None = None
+                        ) -> list[tuple[int, float, float]]:
+    """Leave-one-out ranking: drop one layer, measure Δcos(h) and Δtext KL.
+
+    Returns ``[(layer, mean_cosine_to_teacher, text_kl_diff), ...]`` sorted by the
+    most harmful (lowest cosine) first.  No training needed.
+    """
+    n = len(teacher_lm.transformer.layers)
+    if candidates is None:
+        candidates = list(range(n))
+    t_out = forward_distill(teacher_lm, codes)
+    if frame_valid is None:
+        frame_valid = codes[:, teacher_lm.audio_offset] != teacher_lm.zero_token_id
+    rows = []
+    for l in candidates:
+        kept = [i for i in range(n) if i != l]
+        s = build_student(teacher_lm, kept, dict(base_kwargs),
+                          dtype=next(teacher_lm.parameters()).dtype)
+        s.eval()
+        s_out = forward_distill(s, codes)
+        cos = F.cosine_similarity(s_out["hidden"].float(), t_out["hidden"].float(),
+                                  dim=-1)                          # [B, T]
+        w = frame_valid.float()
+        mean_cos = float((cos * w).sum() / w.sum().clamp(min=1e-8))
+        rows.append((l, mean_cos, 0.0))
+        del s
+    rows.sort(key=lambda r: r[1])
+    return rows
+
+
+
+
+def train_step(student: LMModel, teacher: LMModel, codes: torch.Tensor,
+               weights: BackboneDistillWeights, stage: int,
+               autocast_dtype: torch.dtype | None = None
+               ) -> tuple[torch.Tensor, dict[str, float]]:
+    """One teacher-online distillation step. Returns (loss, stats).
+
+    The caller owns backward/optimizer so it can do gradient accumulation.
+    """
+    pad_ids = {teacher.text_padding_token_id, teacher.end_of_text_padding_id}
+    s_feat_layers = getattr(student, "_feat_layers", None)
+    with torch.no_grad():
+        if s_feat_layers:
+            t_feat_layers = [student._kept_layers[i] for i in s_feat_layers]
+            t_out = forward_distill(teacher, codes, feat_layers=t_feat_layers)
+            t_out["feats"] = {s: t_out["feats"][t]
+                              for s, t in zip(s_feat_layers, t_feat_layers)}
+        else:
+            t_out = forward_distill(teacher, codes)
+
+    if autocast_dtype is not None:
+        with torch.autocast(device_type="cuda", dtype=autocast_dtype):
+            s_out = forward_distill(student, codes, feat_layers=s_feat_layers)
+    else:
+        s_out = forward_distill(student, codes, feat_layers=s_feat_layers)
+    frame_valid = frame_valid_mask(codes, teacher.audio_offset, teacher.zero_token_id)
+    loss, stats = backbone_distill_loss(s_out, t_out, codes, frame_valid,
+                                        pad_ids, weights, stage)
+    return loss, stats
+
+
+# ---------------------------------------------------------------------------
+# Multi-stage trainer (plan §5.2/§5.3)
+# ---------------------------------------------------------------------------
+
+def load_student_weights(student: LMModel, path: str | Path) -> LMModel:
+    """Load a checkpoint into ``student``, casting floating tensors to the
+    student's parameter dtype (so a bf16 checkpoint loads into an fp32-training
+    student, and vice versa)."""
+    pkg = torch.load(path, map_location="cpu", weights_only=False)
+    sd = pkg["state_dict"] if isinstance(pkg, dict) and "state_dict" in pkg else pkg
+    param_dtype = next(student.parameters()).dtype
+    sd = {k: (v.to(param_dtype) if v.is_floating_point() else v)
+          for k, v in sd.items()}
+    student.load_state_dict(sd, strict=True)
+    return student
+
+
+def _resolve_ckpt_path(checkpoint: str | Path) -> Path:
+    ckpt = Path(checkpoint)
+    if ckpt.is_dir():
+        ckpt = ckpt / "student.pt"
+    if not ckpt.exists():
+        raise FileNotFoundError(
+            f"student checkpoint not found: {ckpt}. Pass a 'student.pt' file "
+            f"or a step_<N> directory.")
+    return ckpt
+
+
+def load_student_backbone(checkpoint: str | Path, teacher_lm: LMModel,
+                          device=None, dtype=None):
+    """Rebuild a pruned backbone student from a `backbone_distill.py fit`
+    checkpoint.  Returns ``(student_lm, kept_layers)``.
+
+    Architecture comes from the checkpoint's stored ``base_kwargs`` when
+    present (self-contained), else from the released config (`teacher_kwargs`).
+    """
+    ckpt = _resolve_ckpt_path(checkpoint)
+    pkg = torch.load(ckpt, map_location="cpu", weights_only=False)
+    if not isinstance(pkg, dict) or "kept_layers" not in pkg:
+        raise ValueError(
+            f"{ckpt} is not a pruned-backbone checkpoint (no 'kept_layers').")
+    kept = list(pkg["kept_layers"])
+    base_kwargs = pkg.get("base_kwargs") or teacher_kwargs(teacher_lm.dep_q)
+    base_kwargs = dict(base_kwargs)
+    base_kwargs["dep_q"] = int(teacher_lm.dep_q)
+    n_q = int(getattr(teacher_lm, "n_q", base_kwargs.get("n_q", 16)))
+    base_kwargs["n_q"] = n_q
+    student = build_student(teacher_lm, kept, base_kwargs,
+                            device=device, dtype=dtype)
+    load_student_weights(student, ckpt)
+    student.eval()
+    return student, kept
+
+
+def detect_student_kind(checkpoint: str | Path) -> str:
+    """'pruned_backbone' or 'legacy_6p25hz', from the checkpoint keys."""
+    pkg = torch.load(_resolve_ckpt_path(checkpoint), map_location="cpu",
+                     weights_only=False)
+    if not isinstance(pkg, dict):
+        raise ValueError(f"unrecognized checkpoint (not a dict): {type(pkg)}")
+    if "kept_layers" in pkg and "cfg" not in pkg:
+        return "pruned_backbone"
+    if "cfg" in pkg:
+        return "legacy_6p25hz"
+    raise ValueError(f"unrecognized checkpoint keys: {list(pkg.keys())}")
+
+
+def _make_optimizer(params, lr: float, weight_decay: float, kind: str):
+    if kind == "adamw8bit":
+        try:
+            import bitsandbytes as bnb
+        except Exception as e:  # noqa: BLE001
+            logger.warning("bitsandbytes unavailable (%s); falling back to AdamW", e)
+            kind = "adamw"
+        else:
+            return bnb.optim.AdamW8bit(params, lr=lr, weight_decay=weight_decay)
+    return torch.optim.AdamW(params, lr=lr, weight_decay=weight_decay,
+                             betas=(0.9, 0.95))
+
+
+def _lr_at(step: int, total: int, warmup: int, stage1_steps: int,
+           lr_s1: float, lr_s2: float) -> float:
+    base = lr_s1 if step < stage1_steps else lr_s2
+    if step < warmup:
+        return base * (step + 1) / max(1, warmup)
+    t = (step - warmup) / max(1, total - warmup)
+    import math
+    return base * 0.5 * (1.0 + math.cos(math.pi * min(1.0, t)))
+
+
+@torch.no_grad()
+def evaluate(student: LMModel, teacher: LMModel, tokens: list[torch.Tensor],
+             device, batch_size: int = 4, max_samples: int = 40,
+             autocast_dtype: torch.dtype | None = None) -> dict[str, float]:
+    """Held-out quality: hidden cosine, text top-1 agreement, PAD rate."""
+    student.eval()
+    pad = teacher.zero_token_id
+    pad_ids = {teacher.text_padding_token_id, teacher.end_of_text_padding_id}
+    cos_num = cos_den = 0.0
+    agree_num = agree_den = 0.0
+    agree_np_num = agree_np_den = 0.0
+    pad_num = pad_den = 0.0
+    tpad_num = 0.0
+    idx = range(0, min(len(tokens), max_samples), batch_size)
+    for s in idx:
+        batch = _collate_token_batch(tokens[s:s + batch_size], pad, device)
+        t_out = forward_distill(teacher, batch)
+        if autocast_dtype is not None:
+            with torch.autocast("cuda", dtype=autocast_dtype):
+                s_out = forward_distill(student, batch)
+        else:
+            s_out = forward_distill(student, batch)
+        valid = frame_valid_mask(batch, teacher.audio_offset, teacher.zero_token_id).float()
+        cos = F.cosine_similarity(s_out["hidden"].float(), t_out["hidden"].float(), dim=-1)
+        cos_num += float((cos * valid).sum()); cos_den += float(valid.sum())
+        tm = t_out["text_mask"][:, 0].float()
+        s_arg = s_out["text_logits"][:, 0].argmax(-1)
+        t_arg = t_out["text_logits"][:, 0].argmax(-1)
+        agree = ((s_arg == t_arg).float() * tm)
+        agree_num += float(agree.sum()); agree_den += float(tm.sum())
+        t_is_pad = torch.zeros_like(t_arg, dtype=torch.float)
+        s_is_pad = torch.zeros_like(s_arg, dtype=torch.float)
+        for pid in pad_ids:
+            t_is_pad = torch.maximum(t_is_pad, (t_arg == pid).float())
+            s_is_pad = torch.maximum(s_is_pad, (s_arg == pid).float())
+        tpad_num += float((t_is_pad * tm).sum())
+        nonpad = (t_is_pad == 0).float() * tm
+        agree_np_num += float((agree * nonpad).sum()); agree_np_den += float(nonpad.sum())
+        pad_num += float((s_is_pad * tm).sum()); pad_den += float(tm.sum())
+    student.train()
+    return {
+        "cos_hidden": cos_num / max(cos_den, 1.0),
+        "text_agree": agree_num / max(agree_den, 1.0),
+        "text_agree_nonpad": agree_np_num / max(agree_np_den, 1.0),
+        "text_pad_rate": pad_num / max(pad_den, 1.0),
+        "teacher_pad_rate": tpad_num / max(pad_den, 1.0),
+    }
+
+
+def fit(teacher_lm, tokens: list[torch.Tensor], kept_layers: list[int], device,
+        base_kwargs: dict | None = None, epochs: int = 4, batch_size: int = 8,
+        lr_s1: float = 2e-5, lr_s2: float = 1e-5, stage1_frac: float = 0.2,
+        grad_accum: int = 1, grad_clip: float = 1.0, weight_decay: float = 0.01,
+        warmup_steps: int = 100, log_every: int = 10, eval_every: int = 200,
+        save_every: int = 500, max_steps: int | None = None,
+        out_dir: str | Path = "checkpoints/backbone_distill",
+        student_dtype=torch.float32, autocast_dtype: torch.dtype | None = None,
+        optimizer_kind: str = "adamw", held_out: int = 8, seed: int = 0,
+        weights: BackboneDistillWeights | None = None,
+        feat_layers: list[int] | None = None,
+        save_dtype: torch.dtype | None = torch.bfloat16,
+        samples_per_epoch: int | None = None) -> LMModel:
+    """Distill a depth-pruned student from a tokens-only rollout cache.
+
+    Stage 1 (first ``stage1_frac``): ``L_h + L_feat`` with embeddings/heads
+    frozen.  Stage 2: ``L_h + L_text + w_audio*L_audio``, embeddings/heads
+    unfrozen at ``lr_s2``.  Teacher is run online under ``no_grad``.
+    """
+    weights = weights or BackboneDistillWeights()
+    base_kwargs = base_kwargs or teacher_kwargs()
+    torch.manual_seed(seed)
+    device = torch.device(device)
+
+    teacher_lm.eval()
+    for p in teacher_lm.parameters():
+        p.requires_grad_(False)
+
+    student = build_student(teacher_lm, kept_layers, base_kwargs,
+                            device=device, dtype=student_dtype)
+    student._kept_layers = kept_layers
+    # pick a few top student layers for L_feat, mapped to their teacher layers
+    if feat_layers is None and len(kept_layers) >= 3:
+        feat_layers = [len(kept_layers) - 3]
+    student._feat_layers = feat_layers or None
+
+    # optimizer over all potentially-trainable params (depformer stays frozen)
+    opt_params = [p for p in student.parameters() if p.requires_grad]
+    opt = _make_optimizer(opt_params, lr=lr_s1, weight_decay=weight_decay,
+                          kind=optimizer_kind)
+    logger.info("student %d layers | trainable params %.2fB | optim %s | dtype %s",
+                len(kept_layers),
+                sum(p.numel() for p in opt_params) / 1e9, optimizer_kind,
+                student_dtype)
+
+    held_out = min(held_out, max(0, len(tokens) - 1))
+    train_tokens = tokens[:-held_out] if held_out else tokens
+    eval_tokens = tokens[-held_out:] if held_out else []
+    n_steps_per_epoch = max(1, len(train_tokens) // batch_size)
+    total_steps = max_steps or n_steps_per_epoch * epochs
+    stage1_steps = int(total_steps * stage1_frac)
+    freeze_embeddings_and_heads(student, True)   # stage 1
+
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    pad = teacher_lm.zero_token_id
+
+    step, micro, t0 = 0, 0, time.time()
+    opt.zero_grad()
+    for epoch in range(epochs):
+        torch.manual_seed(seed + epoch)
+        perm = torch.randperm(len(train_tokens)).tolist()
+        epoch_sel = perm[:samples_per_epoch] if samples_per_epoch else perm
+        for s in range(0, len(epoch_sel) - batch_size + 1, batch_size):
+            if step >= total_steps:
+                break
+            stage = 1 if step < stage1_steps else 2
+            if step == stage1_steps:
+                freeze_embeddings_and_heads(student, False)
+                logger.info("step %d: switching to stage 2 (embeddings/heads "
+                            "unfrozen, lr=%.1e)", step, lr_s2)
+
+            sel = [train_tokens[i] for i in epoch_sel[s:s + batch_size]]
+            codes = _collate_token_batch(sel, pad, device)
+            loss, stats = train_step(student, teacher_lm, codes, weights, stage,
+                                     autocast_dtype=autocast_dtype)
+            (loss / grad_accum).backward()
+            micro += 1
+            if micro < grad_accum:
+                continue
+            micro = 0
+            nn.utils.clip_grad_norm_(
+                [p for p in student.parameters() if p.requires_grad], grad_clip)
+            lr = _lr_at(step, total_steps, warmup_steps, stage1_steps, lr_s1, lr_s2)
+            for g in opt.param_groups:
+                g["lr"] = lr
+            opt.step()
+            opt.zero_grad()
+            step += 1
+
+            if step % log_every == 0:
+                logger.info("epoch %d step %d/%d stage %d lr=%.2e %s (%.0fs)",
+                            epoch, step, total_steps, stage, lr,
+                            " ".join(f"{k}={v:.4f}" for k, v in stats.items()),
+                            time.time() - t0)
+            if eval_tokens and step % eval_every == 0:
+                ev = evaluate(student, teacher_lm, eval_tokens, device,
+                              autocast_dtype=autocast_dtype)
+                logger.info("[eval] step %d cos_hidden=%.4f text_agree=%.4f "
+                            "text_agree_nonpad=%.4f pad_rate=%.4f (teacher %.4f)",
+                            step, ev["cos_hidden"], ev["text_agree"],
+                            ev["text_agree_nonpad"], ev["text_pad_rate"],
+                            ev["teacher_pad_rate"])
+            if step % save_every == 0:
+                _save_student(out_dir / f"step_{step}", student, kept_layers, stats,
+                              save_dtype=save_dtype, base_kwargs=base_kwargs)
+        if step >= total_steps:
+            break
+
+    _save_student(out_dir / f"step_{step}", student, kept_layers,
+                  {"step": step}, save_dtype=save_dtype, base_kwargs=base_kwargs)
+    logger.info("done: %d steps", step)
+    return student
+
+
+def _save_student(path: Path, student: LMModel, kept_layers: list[int],
+                  stats: dict, save_dtype: torch.dtype | None = torch.bfloat16,
+                  base_kwargs: dict | None = None) -> None:
+    """Save the student in ``save_dtype`` (bf16 by default).
+
+    Training uses fp32 master weights, but the deployment target (and the
+    teacher checkpoint) is bf16, so bf16 is the default on disk: 2x smaller and
+    directly loadable without a cast.  ``base_kwargs`` (the teacher constructor
+    kwargs) is stored so the server can rebuild the exact architecture.
+    """
+    path.mkdir(parents=True, exist_ok=True)
+    sd = student.state_dict()
+    if save_dtype is not None:
+        sd = {k: (v.to(save_dtype) if v.is_floating_point() else v)
+              for k, v in sd.items()}
+    meta = {
+        "state_dict": sd,
+        "kept_layers": kept_layers,
+        "save_dtype": str(save_dtype),
+        "stats": {k: float(v) for k, v in stats.items()
+                  if isinstance(v, (int, float))},
+    }
+    if base_kwargs is not None:
+        meta["base_kwargs"] = {k: v for k, v in base_kwargs.items()
+                               if not isinstance(v, torch.dtype)}
+    torch.save(meta, path / "student.pt")
+    logger.info("saved %s (%s)", path / "student.pt", save_dtype)
+
+
+# ---------------------------------------------------------------------------
+# Self test + CLI
+# ---------------------------------------------------------------------------
+
+def _tiny_teacher() -> tuple[LMModel, dict]:
+    delays = [0, 0, 1, 1, 1, 1, 1, 1, 1, 0, 1, 1, 1, 1, 1, 1, 1]
+    kwargs = dict(
+        delays=delays, n_q=16, dep_q=16, card=64, text_card=32,
+        dim=64, num_heads=4, num_layers=2, hidden_scale=2,
+        existing_text_padding_id=3, context=64, causal=True,
+        depformer_dim=32, depformer_dim_feedforward=64,
+        depformer_num_heads=4, depformer_num_layers=2,
+        depformer_multi_linear=True, depformer_weights_per_step=True,
+        depformer_weights_per_step_schedule=list(range(16)),
+        depformer_causal=True, depformer_layer_scale=None, depformer_context=8,
+        depformer_max_period=10000, depformer_gating="silu",
+        depformer_pos_emb="none")
+    torch.manual_seed(0)
+    teacher = LMModel(**kwargs)
+    teacher.eval()
+    for p in teacher.parameters():
+        p.requires_grad_(False)
+    return teacher, kwargs
+
+
+def _self_test() -> None:
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
+    teacher, kwargs = _tiny_teacher()
+
+    # layer selection sanity
+    kept24 = select_layers(32, 16, "spaced")
+    print("select_layers(32,16) ->", kept24)
+    assert len(kept24) == 16 and kept24[:2] == [0, 1] and kept24[-1] == 31
+    kept1 = select_layers(2, 1, keep_first=1, keep_last=1)
+    assert len(kept1) == 1, kept1
+
+    g = torch.Generator().manual_seed(7)
+    codes = torch.randint(0, 64, (2, 17, 16), generator=g)
+    codes[:, 0] = torch.randint(1, 31, (2, 16), generator=g)
+    codes[:, :, -1:] = -1
+
+    # ---- S0 sanity: 0 layers dropped == teacher ----
+    s0 = build_student(teacher, [0, 1], dict(kwargs), dtype=torch.float32)
+    s0.eval()
+    t_out = forward_distill(teacher, codes)
+    s_out = forward_distill(s0, codes)
+    d = (s_out["hidden"] - t_out["hidden"]).abs().max().item()
+    print(f"S0 (0 dropped) max|student - teacher| hidden = {d:.3e}")
+    assert d < 1e-5, d
+
+    # ---- pruned student: 1 of 2 layers ----
+    s1 = build_student(teacher, kept1, dict(kwargs), dtype=torch.float32)
+    s1.train()
+    s1._kept_layers = kept1
+    # feature mapping: student layer 0 -> teacher kept layer
+    s1._feat_layers = [0]
+    for p in s1.parameters():
+        p.requires_grad_(True)
+    for mod in (s1.depformer, s1.depformer_in, s1.depformer_emb,
+                s1.depformer_text_emb, s1.linears):
+        for p in mod.parameters():
+            p.requires_grad_(False)
+
+    w = BackboneDistillWeights()
+    loss1, st1 = train_step(s1, teacher, codes, w, stage=1)
+    print("stage1:", {k: round(v, 4) for k, v in st1.items()})
+    loss2, st2 = train_step(s1, teacher, codes, w, stage=2)
+    print("stage2:", {k: round(v, 4) for k, v in st2.items()})
+    assert torch.isfinite(loss1) and torch.isfinite(loss2)
+
+    # gradients reach the trainable transformer layer, not the frozen depformer
+    opt = torch.optim.AdamW([p for p in s1.parameters() if p.requires_grad], lr=1e-3)
+    opt.zero_grad(); loss2.backward(); opt.step()
+    layer0 = s1.transformer.layers[0]
+    grads = [p.grad is not None for p in layer0.parameters()]
+    print("layer0 params with grad:", sum(grads), "/", len(grads))
+    assert any(grads), "no gradient reached the transformer layer"
+    assert all(p.grad is None for p in s1.depformer.parameters()), "depformer must stay frozen"
+
+    # block influence ranking
+    bi = block_influence(teacher, codes)
+    print("teacher block influence:", [round(v, 4) for v in bi.tolist()])
+    assert bi.shape == (2,)
+
+    # batched rollout token generation (grouping + LMGen batch mechanics)
+    c = torch.randint(0, 64, (1, 17, 12), generator=g)
+    c[:, 0] = torch.randint(0, 32, (1, 12), generator=g)   # valid text ids
+    c[:, :, -1:] = -1
+    samples = [(c.clone(), 3), (c.clone(), 3), (c.clone(), 0)]
+    outs = rollout_tokens_batched(teacher, samples, device="cpu", batch_size=2,
+                                  top_k=16)
+    print("rollout token shapes:", [tuple(o.shape) for o in outs])
+    assert len(outs) == 3 and all(o.dim() == 3 and o.shape[1] == 17 for o in outs)
+
+    # layer-drop ablation ranking
+    ab = layer_drop_ablation(teacher, codes, dict(kwargs))
+    print("layer-drop ablation (layer, cos):",
+          [(l, round(cos, 4)) for l, cos, _ in ab])
+    assert len(ab) == 2
+
+    # tokens-only collect + multi-stage fit smoke
+    import tempfile
+    toks = rollout_tokens_batched(teacher, [(c.clone(), 0) for _ in range(4)],
+                                  device="cpu", batch_size=2, top_k=16)
+    fit(teacher, toks, kept1, "cpu", base_kwargs=dict(kwargs), epochs=1,
+        batch_size=2, max_steps=4, warmup_steps=1, log_every=2, eval_every=2,
+        save_every=100, held_out=1, autocast_dtype=None,
+        out_dir=tempfile.mkdtemp(prefix="bd_self_test_"))
+    print("collect+fit smoke ok")
+
+    print("BACKBONE DISTILL SELF-TEST PASSED")
+
+
+def _build_distill_loader(args, device):
+    from .dataset import build_data_loader
+    from .distill.data import DistillInterleavedTokenizer
+    from .interleaver import Interleaver
+    from .models import loaders
+    import sentencepiece
+    from huggingface_hub import hf_hub_download
+
+    tokenizer = sentencepiece.SentencePieceProcessor(
+        args.tokenizer or hf_hub_download(args.hf_repo, loaders.TEXT_TOKENIZER_NAME))
+    mimi = loaders.get_mimi(
+        args.mimi_weight or hf_hub_download(args.hf_repo, loaders.MIMI_NAME), device)
+    mimi.eval()
+    teacher = loaders.get_moshi_lm(
+        args.moshi_weight or hf_hub_download(args.hf_repo, loaders.MOSHI_NAME),
+        device=device)
+    teacher.eval()
+    interleaver = Interleaver(
+        tokenizer=tokenizer, audio_frame_rate=mimi.frame_rate,
+        text_padding=teacher.text_padding_token_id,
+        end_of_text_padding=teacher.end_of_text_padding_id,
+        zero_padding=teacher.zero_token_id,
+        keep_main_only=True, use_bos_eos=True,
+        main_speaker_label="ASSISTANT", device=str(device))
+    dtok = DistillInterleavedTokenizer(
+        mimi=mimi, interleaver=interleaver, duration_sec=args.duration_sec,
+        target_n_audio_codebooks=teacher.num_audio_codebooks,
+        require_sidecar=not args.allow_missing_sidecar,
+        system_prompt_default=args.default_system_prompt)
+    loader = build_data_loader(instruct_tokenizer=dtok, args=args,
+                               batch_size=args.batch_size, seed=0, rank=0,
+                               world_size=1, is_eval=False)
+    return teacher, loader
+
+
+def _cmd_collect(args) -> None:
+    logging.basicConfig(level=logging.INFO,
+                        format="%(asctime)s %(levelname)s %(message)s")
+    from .models import loaders
+    device = torch.device(args.device)
+    teacher, loader = _build_distill_loader(args, device)
+    tokens = collect_tokens(teacher, loader, device, max_batches=args.max_batches,
+                            max_samples=args.max_samples,
+                            batch_size=args.rollout_batch_size,
+                            temp=args.temp, top_k=args.top_k)
+    torch.save({"tokens": tokens, "meta": {"n": len(tokens)}}, args.out)
+    logger.info("wrote %s (%d rollout samples)", args.out, len(tokens))
+
+
+def _cmd_fit(args) -> None:
+    logging.basicConfig(level=logging.INFO,
+                        format="%(asctime)s %(levelname)s %(message)s")
+    from .models import loaders
+    from huggingface_hub import hf_hub_download
+    device = torch.device(args.device)
+    pkg = torch.load(args.tokens, map_location="cpu", weights_only=False)
+    tokens = pkg["tokens"] if isinstance(pkg, dict) else pkg
+    if args.keep:
+        kept = [int(x) for x in args.keep.split(",")]
+    else:
+        kept = select_layers(32, args.keep_layers, args.strategy)
+    logger.info("kept %d layers: %s", len(kept), kept)
+    moshi_path = args.moshi_weight or hf_hub_download(args.hf_repo, loaders.MOSHI_NAME)
+    teacher = loaders.get_moshi_lm(moshi_path, device=device)
+    teacher.eval()
+    fit(teacher, tokens, kept, device, epochs=args.epochs,
+        batch_size=args.batch_size, lr_s1=args.lr_s1, lr_s2=args.lr_s2,
+        stage1_frac=args.stage1_frac, grad_accum=args.grad_accum,
+        log_every=args.log_every, eval_every=args.eval_every,
+        save_every=args.save_every, max_steps=args.max_steps,
+        out_dir=args.out_dir, held_out=args.held_out,
+        student_dtype=(torch.bfloat16 if args.student_dtype == "bfloat16"
+                       else torch.float32),
+        autocast_dtype=(torch.bfloat16 if args.autocast == "bfloat16" else None),
+        save_dtype=(torch.bfloat16 if args.save_dtype == "bfloat16" else None),
+        samples_per_epoch=args.samples_per_epoch,
+        optimizer_kind=args.optim)
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("--self-test", action="store_true")
+    sub = ap.add_subparsers(dest="cmd")
+
+    c = sub.add_parser("collect")
+    c.add_argument("--train-data", required=True)
+    c.add_argument("--eval-data", default="")
+    c.add_argument("--duration-sec", type=float, default=20.0)
+    c.add_argument("--batch-size", type=int, default=4)          # loader batch
+    c.add_argument("--rollout-batch-size", type=int, default=32)
+    c.add_argument("--max-batches", type=int, default=100000)
+    c.add_argument("--max-samples", type=int, default=2000)
+    c.add_argument("--temp", type=float, default=0.8)
+    c.add_argument("--top-k", type=int, default=250)
+    c.add_argument("--shuffle", dest="shuffle", action="store_true", default=True)
+    c.add_argument("--no-shuffle", dest="shuffle", action="store_false")
+    c.add_argument("--allow-missing-sidecar", action="store_true")
+    c.add_argument("--default-system-prompt", default=None)
+    c.add_argument("--hf-repo", default="nvidia/personaplex-7b-v1")
+    c.add_argument("--moshi-weight", default=None)
+    c.add_argument("--mimi-weight", default=None)
+    c.add_argument("--tokenizer", default=None)
+    c.add_argument("--device", default="cuda")
+    c.add_argument("--out", default="rollout_tokens.pt")
+    c.set_defaults(func=_cmd_collect)
+
+    f = sub.add_parser("fit")
+    f.add_argument("--tokens", required=True)
+    f.add_argument("--keep", default=None, help="comma-separated teacher layer indices")
+    f.add_argument("--keep-layers", type=int, default=16)
+    f.add_argument("--strategy", default="spaced", choices=["spaced", "contiguous"])
+    f.add_argument("--epochs", type=int, default=4)
+    f.add_argument("--batch-size", type=int, default=8)
+    f.add_argument("--grad-accum", type=int, default=1)
+    f.add_argument("--lr-s1", type=float, default=2e-5)
+    f.add_argument("--lr-s2", type=float, default=1e-5)
+    f.add_argument("--stage1-frac", type=float, default=0.2)
+    f.add_argument("--max-steps", type=int, default=None)
+    f.add_argument("--samples-per-epoch", type=int, default=None,
+                   help="cap rollouts used per epoch (bounds epoch time on the "
+                        "full cache; default all)")
+    f.add_argument("--held-out", type=int, default=8)
+    f.add_argument("--student-dtype", default="float32",
+                   choices=["float32", "bfloat16"])
+    f.add_argument("--save-dtype", default="bfloat16",
+                   choices=["float32", "bfloat16"],
+                   help="dtype stored in the checkpoint (default bf16, the "
+                        "deployment target; ~2x smaller than the fp32 master)")
+    f.add_argument("--autocast", default="none", choices=["none", "bfloat16"])
+    f.add_argument("--optim", default="adamw", choices=["adamw", "adamw8bit"])
+    f.add_argument("--log-every", type=int, default=10)
+    f.add_argument("--eval-every", type=int, default=100)
+    f.add_argument("--save-every", type=int, default=500)
+    f.add_argument("--out-dir", default="checkpoints/backbone_distill")
+    f.add_argument("--hf-repo", default="nvidia/personaplex-7b-v1")
+    f.add_argument("--moshi-weight", default=None)
+    f.add_argument("--device", default="cuda")
+    f.set_defaults(func=_cmd_fit)
+
+    args = ap.parse_args()
+    if args.self_test or args.cmd is None:
+        _self_test()
+        return
+    args.func(args)
+
+
+if __name__ == "__main__":
+    main()

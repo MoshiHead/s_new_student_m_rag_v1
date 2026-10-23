@@ -1,0 +1,452 @@
+"""
+distill/data.py
+===============
+Distillation-side tokenizer: builds plain (text, audio) token streams for the
+PersonaPlex -> student distillation, WITHOUT any of the RAG-specific parts
+(ref slots, <ref>/<lookup> splicing, SegmentMeta, weighted spans).
+
+Sidecar handling:
+
+- `use_sidecar=True` (default) and a `.sidecar.json` exists next to the audio:
+    + stereo input is split into agent/user channels via speaker-masked
+      waveforms (exactly the RAG convention, minus everything RAG),
+    + the agent-channel transcript fills the text codebook so the student
+      keeps real text-generation targets (L_task text CE stays meaningful),
+    + the sidecar's `metadata.system_prompt` (or `system_prompt_default`) is
+      spliced as a `<system> ... <system>` block at the start of the stream,
+      exactly as the inference server feeds it.
+- `require_sidecar=True` (default): a missing/unreadable sidecar RAISES. The
+  old silent fallback (mono mix + inert text) trains the model on
+  mixed-speaker "agent" audio with no transcript, which shows up exactly as
+  garbled audio + wrong/missing text after training.
+- `--allow-missing-sidecar` re-enables the degraded fallback (not advised):
+    + audio is mono-averaged (channel-mean) and mimi-encoded as-is,
+    + text codebook is all `zero_padding` (-1) -> text CE contributes ~0 and
+      the student gets its text behavior purely from `L_KD` (teacher logits).
+
+Samples always come back with `segment_meta=None` / `reference_text=""`,
+so the existing loss paths treat them as plain audio:
+
+    compute_text_loss_rag(..., seg_weights=ones)   # uniform weights
+    compute_audio_loss(..., synthetic_keep=None)   # no RAG masking
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import math
+import os
+
+import numpy as np
+import torch
+
+from ..interleaver import (
+    Interleaver,
+    Sample,
+    _build_speaker_masked_waveform,
+    _build_forced_audio_channels,
+    _pad_to_target_n_q,
+    wrap_with_system_tags,
+    parse_segment_meta,
+    splice_rag_frames,
+    shift_spans_from,
+)
+
+logger = logging.getLogger(__name__)
+
+
+class _Diag:
+    """Rate-limited sample diagnostics (first N per category, then counts)."""
+
+    def __init__(self, verbose_n: int = 5):
+        self.verbose_n = verbose_n
+        self.counts: dict[str, int] = {}
+
+    def hit(self, category: str) -> bool:
+        n = self.counts.get(category, 0)
+        self.counts[category] = n + 1
+        return n < self.verbose_n
+
+    def summary(self) -> str:
+        return ", ".join(f"{k}={v}" for k, v in sorted(self.counts.items()))
+
+
+_diag = _Diag()
+
+
+class DistillInterleavedTokenizer:
+    """RAG-free re-implementation of InterleavedTokenizer for distillation.
+
+    Args:
+        mimi: frozen MimiModel — same instance the Interleaver was built with.
+        interleaver: Interleaver instance (tokenizer, zero_padding, frame rate,
+            prepare_item).
+        duration_sec: chunk length in seconds (keep `duration_sec*12.5` EVEN).
+        target_n_audio_codebooks: pad audio channels up to this many (16 for
+            PersonaPlex).
+        use_sidecar: if True, use sidecar transcript + speaker masking when
+            the sidecar file exists; if False, never read sidecars.
+        require_sidecar: if True (default), raise when a sample has no readable
+            sidecar instead of silently falling back to a mono mix. The mono
+            fallback puts BOTH speakers in the agent stream and leaves the text
+            stream inert, i.e. it trains the model to answer with mixed audio
+            and no text - exactly the "garbled audio / wrong text" failure
+            mode. Only disable if you really want that degenerate mode.
+        system_prompt_default: used when a sample's sidecar carries no
+            system_prompt. The serving path feeds the persona text as
+            "<system> ... <system>" before the conversation, so distillation
+            data must contain that convention too; if your sidecars lack
+            system prompts, set this to the persona text you serve with.
+    """
+
+    def __init__(
+        self,
+        mimi,
+        interleaver: Interleaver,
+        duration_sec: float,
+        target_n_audio_codebooks: int | None = 16,
+        use_sidecar: bool = True,
+        require_sidecar: bool = True,
+        system_prompt_default: str | None = None,
+        agent_speaker_label: str = "ASSISTANT",
+        user_speaker_label: str = "USER",
+        use_rag: bool = False,
+        return_meta: bool = False,
+        ref_mode: str = "slots",
+        n_ref_slots: int = 16,
+        max_ref_source_tokens: int = 400,
+        ref_tokens_per_slot: int = 4,
+        min_ref_slots: int = 1,
+        ref_slots_after_query: bool = True,
+    ):
+        self.mimi = mimi
+        self.interleaver = interleaver
+        self.duration_sec = duration_sec
+        self.num_audio_frames = math.ceil(duration_sec * mimi.frame_rate)
+        if self.num_audio_frames % 2 != 0:
+            raise ValueError(
+                f"duration_sec {duration_sec} -> {self.num_audio_frames} audio "
+                f"frames (ODD). The 2-frame compressor in the student needs an "
+                f"EVEN frame count (e.g. duration_sec=100 -> 1250)."
+            )
+        self.target_n_audio_codebooks = target_n_audio_codebooks
+        self.use_sidecar = use_sidecar
+        self.require_sidecar = require_sidecar
+        self.system_prompt_default = system_prompt_default
+        self.agent_speaker_label = agent_speaker_label
+        self.user_speaker_label = user_speaker_label
+
+        # Optional RAG: splice <lookup> + <ref_start> [K slots] <ref_end> and
+        # return segment_meta / reference_text so the trainer can inject the
+        # RefAdapter vectors and apply the reliance loss. Default OFF so the
+        # working RAG-free distillation path is unchanged.
+        assert ref_mode in ("slots", "off"), ref_mode
+        self.use_rag = use_rag and ref_mode == "slots"
+        self.return_meta = bool(return_meta) or self.use_rag
+        self.ref_mode = ref_mode
+        self.n_ref_slots = n_ref_slots
+        self.max_ref_source_tokens = max_ref_source_tokens
+        self.ref_tokens_per_slot = ref_tokens_per_slot
+        self.min_ref_slots = min_ref_slots
+        self.ref_slots_after_query = ref_slots_after_query
+
+    def _sidecar_for(self, path: str) -> dict | None:
+        if not self.use_sidecar:
+            return None
+        info_file = os.path.splitext(path)[0] + ".sidecar.json"
+        if not os.path.exists(info_file):
+            if self.require_sidecar:
+                raise FileNotFoundError(
+                    f"distill: no sidecar for {path} (expected {info_file}). "
+                    f"Distillation needs the speaker-masked stereo channels and "
+                    f"the agent transcript; a mono fallback would train the "
+                    f"model to produce mixed-speaker audio and no text. Pass "
+                    f"--allow-missing-sidecar to override (NOT recommended)."
+                )
+            if _diag.hit("sidecar_missing"):
+                logger.warning(
+                    f"distill: no sidecar for {path}; falling back to MONO mix "
+                    f"+ inert text (agent stream will contain the user too)"
+                )
+            return None
+        try:
+            with open(info_file) as f:
+                return json.load(f)
+        except Exception as e:  # malformed sidecar -> treat as absent
+            if self.require_sidecar:
+                raise
+            logger.warning(f"distill: failed to load sidecar {info_file}: {e}")
+            return None
+
+    # -- sidecar field access (this data's actual schema) ------------------
+    # Observed sidecar schema:
+    #   {
+    #     "alignments": [[word, [start_sec, end_sec], "ASSISTANT"|"USER"], ...],
+    #     "duration": <sec>,
+    #     "segment_meta": {...},            # RAG-only -> IGNORED here
+    #     "text_conditions": {
+    #         "reference": "...",           # RAG-only -> IGNORED here
+    #         "system_prompt": "..."        # persona -> used as <system> block
+    #     }
+    #   }
+    # The RAG tokenizer read channel/system-prompt from "metadata"; this data
+    # puts the persona under "text_conditions", so look in both places.
+
+    @staticmethod
+    def _sidecar_get(sidecar: dict | None, key: str, default=None):
+        if not sidecar:
+            return default
+        for container in (sidecar.get("text_conditions"),
+                          sidecar.get("metadata"),
+                          sidecar):
+            if isinstance(container, dict) and container.get(key) is not None:
+                return container[key]
+        return default
+
+    def _chunk_alignments(self, alignments: list | None, start_sec: float) -> list:
+        """Window the GLOBAL file alignments to this chunk, then shift to
+        chunk-relative seconds. The alignments are whole-file times (the sidecar
+        is per recording, not per chunk), so passing them through un-windowed
+        would let words from BEFORE the chunk leak into its text stream at
+        frame 0 (and words after the chunk's end pile up at the tail). Same
+        dicho() convention as the RAG tokenizer."""
+        if not alignments:
+            return []
+        end_sec = start_sec + self.duration_sec
+        return [
+            (a[0], (a[1][0] - start_sec, a[1][1] - start_sec), a[2])
+            for a in alignments
+            if a[1][1] > start_sec and a[1][0] < end_sec
+        ]
+
+    @staticmethod
+    def _span_energy(wav_1ch: np.ndarray, alignments: list, speaker: str,
+                     sample_rate: int) -> float:
+        """Mean sample energy of wav_1ch inside `speaker`'s word spans."""
+        total, n = 0.0, 0
+        for _word, (s, e), spk in alignments:
+            if spk != speaker:
+                continue
+            a = max(0, int(s * sample_rate))
+            b = min(wav_1ch.shape[-1], int(e * sample_rate))
+            if b > a:
+                total += float(np.square(wav_1ch[..., a:b]).sum())
+                n += (b - a)
+        return total / max(n, 1)
+
+    def _check_channel_order(self, wav: np.ndarray, alignments: list,
+                             agent_ch: int, user_ch: int, sr: int) -> None:
+        """Loud check that the configured agent channel really carries the
+        agent. If the stereo order is swapped, the distillation targets put the
+        USER's speech in the agent audio stream (and vice-versa) while the text
+        codebook carries the agent's words -> the trained model produces
+        unintelligible audio. Cheap energy heuristic, warning only."""
+        if not alignments or not _diag.hit("channel_order_check"):
+            return
+        agent_on_agent = self._span_energy(wav[agent_ch], alignments,
+                                           self.agent_speaker_label, sr)
+        agent_on_user = self._span_energy(wav[agent_ch], alignments,
+                                          self.user_speaker_label, sr)
+        if agent_on_agent > 0 and agent_on_user > 4.0 * agent_on_agent:
+            logger.error(
+                "distill: stereo channels look SWAPPED — the channel configured "
+                "as agent (index %s) has %.1fx more energy during USER speech "
+                "than during ASSISTANT speech. Set agent_channel/user_channel in "
+                "the sidecar metadata (or swap your recording order) or the "
+                "model will be taught to speak the user's audio.",
+                agent_ch, agent_on_user / max(agent_on_agent, 1e-12))
+        else:
+            logger.info(
+                "distill: channel-order check OK (agent ch %s: "
+                "agent-span energy %.3g vs user-span %.3g)",
+                agent_ch, agent_on_agent, agent_on_user)
+
+    def _encode_audio(self, wav: np.ndarray, sidecar: dict | None,
+                      chunk_alignments: list) -> torch.Tensor:
+        """Returns audio tokens [1, n_q_real, T]. Speaker-masked stereo when
+        possible (sidecar present + stereo), else mono-averaged encode."""
+        dev = next(self.mimi.parameters()).device
+        is_stereo = sidecar is not None and wav.ndim == 2 and wav.shape[0] >= 2
+        if is_stereo:
+            agent_ch = self._sidecar_get(sidecar, "agent_channel", 0)
+            user_ch = self._sidecar_get(sidecar, "user_channel", 1)
+            if _diag.hit("channel_order_default"):
+                logger.info(
+                    "distill: using channels agent=%s user=%s (from sidecar or "
+                    "defaults 0/1) — confirm the stereo order matches your "
+                    "recording convention", agent_ch, user_ch)
+            sr = self.mimi.sample_rate
+            self._check_channel_order(wav, chunk_alignments, agent_ch, user_ch, sr)
+            agent_wav = _build_speaker_masked_waveform(
+                wav[agent_ch:agent_ch + 1], chunk_alignments,
+                self.agent_speaker_label, sr,
+            )
+            user_wav = _build_speaker_masked_waveform(
+                wav[user_ch:user_ch + 1], chunk_alignments,
+                self.user_speaker_label, sr,
+            )
+            agent = torch.from_numpy(agent_wav).float().to(dev).unsqueeze(0)
+            user = torch.from_numpy(user_wav).float().to(dev).unsqueeze(0)
+            if (chunk_alignments
+                    and float(abs(agent_wav).max()) < 1e-6
+                    and float(abs(user_wav).max()) < 1e-6
+                    and _diag.hit("speaker_mask_all_zero")):
+                logger.error(
+                    "distill: BOTH speaker-masked channels are silent for this "
+                    "chunk although alignments exist — the sidecar speaker "
+                    "labels almost certainly do not match agent_speaker_label=%r "
+                    "/ user_speaker_label=%r. If this is the norm, training is "
+                    "learning silence->garbage.",
+                    self.agent_speaker_label, self.user_speaker_label,
+                )
+            with torch.no_grad():
+                return torch.cat(
+                    [self.mimi.encode(agent), self.mimi.encode(user)], dim=1
+                )
+
+        if wav.ndim == 1:
+            wav = wav[None, :]
+        if wav.shape[0] > 1:  # stereo without sidecar -> average down to mono
+            wav = wav.mean(axis=0, keepdims=True)
+        # mono wav is [1, T] -> mimi.encode wants [B, C=1, T]
+        if _diag.hit("mono_fallback_no_sidecar"):
+            logger.warning(
+                "distill: MONO encode without sidecar -> the agent stream will "
+                "contain both speakers and the text stream is inert; this is "
+                "the degraded fallback mode"
+            )
+        with torch.no_grad():
+            return self.mimi.encode(
+                torch.from_numpy(np.ascontiguousarray(wav)).float().to(dev).unsqueeze(0)
+            )
+
+    def _text_tokens(self, sidecar: dict | None, chunk_alignments: list) -> torch.Tensor:
+        T = self.num_audio_frames
+        device = self.interleaver.device
+        if sidecar is None:
+            # No transcript: text stream is inert (zero embeddings, masked CE).
+            return torch.full((1, 1, T), self.interleaver.zero_padding,
+                              dtype=torch.long, device=device)
+        # Same tokenization convention as the RAG path minus the <system>
+        # prompt and ref-slot allocation logic. keep_main_only=True already
+        # restricts the stream to the agent's own words -> no need to pass
+        # an explicit main_speaker.
+        text_tokens = self.interleaver.prepare_item(chunk_alignments, self.duration_sec)
+        return torch.nn.functional.pad(
+            text_tokens, (0, T - text_tokens.shape[-1]),
+            value=self.interleaver.zero_padding,
+        )[:, :, :T]
+
+    # -- system prompt frames (serve/train parity) --------------------------
+
+    def _build_forced_text_frames(self, wrapped_text: str, n_q: int):
+        """Forced text frames + silence(agent)/sine(user) audio, exactly the
+        layout the serving prompt path uses. Returns (text [1,1,N], audio
+        [1,n_q,N])."""
+        tokens = self.interleaver.tokenizer.encode(wrapped_text)
+        device = self.interleaver.device
+        n = len(tokens)
+        text = torch.tensor(tokens, device=device).view(1, 1, n)
+        audio = _build_forced_audio_channels(
+            n_q, n, self.interleaver.zero_padding, device)
+        return text, audio
+
+    def _system_prompt_frames(self, sidecar: dict | None, n_q: int):
+        """The agent's <system> persona block. The server feeds this exact
+        convention (`wrap_with_system_tags`) before every conversation, so the
+        student must see it during distillation or it cannot condition on the
+        persona -> the "model does not say the greeting" failure.
+
+        This data carries the persona at `text_conditions.system_prompt`."""
+        prompt = self._sidecar_get(sidecar, "system_prompt", None)
+        if not prompt:
+            prompt = self.system_prompt_default
+        if not prompt:
+            if sidecar is not None and _diag.hit("no_system_prompt_in_sidecar"):
+                logger.warning(
+                    "distill: sidecar has no system_prompt (looked in "
+                    "text_conditions/metadata); pass --default-system-prompt so "
+                    "the model learns the persona convention")
+            return None
+        text, audio = self._build_forced_text_frames(
+            wrap_with_system_tags(prompt), n_q)
+        if _diag.hit("system_prompt_frames"):
+            logger.info("distill: injecting system-prompt frames (%d tokens): %r",
+                        text.shape[-1], prompt[:120])
+        return text, audio
+
+    def __call__(self, wav: np.ndarray, start_sec: float, path: str) -> Sample:
+        with torch.no_grad():
+            sidecar = self._sidecar_for(path)
+            chunk_alignments = self._chunk_alignments(
+                sidecar.get("alignments") if sidecar is not None else None,
+                start_sec,
+            )
+
+            audio_tokens = self._encode_audio(wav, sidecar, chunk_alignments)
+
+            this_len = audio_tokens.shape[-1]
+            audio_tokens = torch.nn.functional.pad(
+                audio_tokens[..., : self.num_audio_frames],
+                (0, self.num_audio_frames - this_len),
+                value=self.interleaver.zero_padding,
+            ).view(1, -1, self.num_audio_frames)
+            if (self.target_n_audio_codebooks is not None
+                    and audio_tokens.shape[1] != self.target_n_audio_codebooks):
+                audio_tokens = _pad_to_target_n_q(
+                    audio_tokens, self.target_n_audio_codebooks,
+                    audio_tokens.device,
+                )
+
+            text_tokens = self._text_tokens(sidecar, chunk_alignments)
+
+            # Optional RAG: splice <lookup> + <ref_start> [K slots] <ref_end>.
+            # `no_rag_qa` / `regular_chat` sidecars carry no lookup/body spans
+            # (build_sidecard honours `rag_kind`), so they pass through as plain
+            # distillation samples.
+            segment_meta = None
+            reference_text = ""
+            if self.use_rag:
+                segment_meta = parse_segment_meta(
+                    (sidecar or {}).get("segment_meta"),
+                    start_sec, self.duration_sec, self.mimi.frame_rate,
+                )
+                reference_text = self._sidecar_get(sidecar, "reference", "") or ""
+                text_tokens, audio_tokens, segment_meta = splice_rag_frames(
+                    text_tokens, audio_tokens, segment_meta, reference_text,
+                    self.interleaver,
+                    n_ref_slots=self.n_ref_slots,
+                    max_ref_source_tokens=self.max_ref_source_tokens,
+                    ref_tokens_per_slot=self.ref_tokens_per_slot,
+                    min_ref_slots=self.min_ref_slots,
+                    ref_slots_after_query=self.ref_slots_after_query,
+                )
+            elif self.return_meta:
+                # Meta only (no splicing): gives the collector the true
+                # turn boundaries so it can truncate the teacher free-run tail.
+                segment_meta = parse_segment_meta(
+                    (sidecar or {}).get("segment_meta"),
+                    start_sec, self.duration_sec, self.mimi.frame_rate,
+                )
+
+            # Prepend the <system> persona block at the start of the stream,
+            # exactly like the RAG InterleavedTokenizer and the inference
+            # server do (only for the chunk starting at t=0 of the recording).
+            if start_sec == 0.0:
+                sys_frames = self._system_prompt_frames(sidecar, audio_tokens.shape[1])
+                if sys_frames is not None:
+                    sys_text, sys_audio = sys_frames
+                    text_tokens = torch.cat([sys_text, text_tokens], dim=-1)
+                    audio_tokens = torch.cat([sys_audio, audio_tokens], dim=-1)
+                    if segment_meta is not None:
+                        segment_meta = shift_spans_from(
+                            segment_meta, 0, sys_text.shape[-1])
+
+            has_body = segment_meta is not None and segment_meta.body_start >= 0
+            return Sample(
+                codes=torch.cat([text_tokens, audio_tokens], dim=1),
+                segment_meta=segment_meta,
+                reference_text=reference_text if has_body else "",
+                condition_attributes=None,
+            )

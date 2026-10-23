@@ -1,0 +1,9 @@
+{
+  "model": "sentence-transformers/all-MiniLM-L6-v2",
+  "rerank": "cross-encoder/ms-marco-MiniLM-L-6-v2",
+  "n_docs": 4998,
+  "dim": 384,
+  "hit@1": 0.8383353341336535,
+  "hit@5": 0.9405762304921969,
+  "rerank_top": 50
+}
